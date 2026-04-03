@@ -175,7 +175,11 @@ def get_session():
 
 # Main
 def main():
-    print(f"Scanning {len(symbols)} symbols at {datetime.utcnow()}")
+    symbols = get_top_symbols(MAX_SYMBOLS)   # first define symbols
+    print(f"Scanning {len(symbols)} symbols at {datetime.utcnow()}")   # then print
+
+    setups = []
+    # ... rest of your code (the scanning loop, etc.)
     print("Starting scanner...")
     drive = get_drive_service()
     symbols = get_top_symbols(MAX_SYMBOLS)
