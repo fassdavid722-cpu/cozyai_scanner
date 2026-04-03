@@ -1,21 +1,25 @@
-name: CozyAI Scanner
+name: Cozy AI Scanner
 
 on:
-  schedule:
-    - cron: '*/10 * * * *'
+  push:
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
-  scan:
+  run-scanner:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: "3.11"
+
       - name: Install dependencies
         run: pip install ccxt pandas numpy google-api-python-client google-auth-httplib2 google-auth-oauthlib requests
+
       - name: Run scanner
         env:
           GDRIVE_CREDS: ${{ secrets.GDRIVE_CREDS }}
