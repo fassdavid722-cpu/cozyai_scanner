@@ -41,7 +41,14 @@ def download_file(drive, filename, folder_id):
     if not files:
         return None
     file_id = files[0]['id']
-    request = drive.files().get_media(fileId=file_id)
+    # Get the file's MIME type
+    file_meta = drive.files().get(fileId=file_id, fields="mimeType").execute()
+    mime_type = file_meta.get('mimeType')
+    # If it's a Google Sheets file, export as CSV
+    if mime_type == 'application/vnd.google-apps.spreadsheet':
+        request = drive.files().export_media(fileId=file_id, mimeType='text/csv')
+    else:
+        request = drive.files().get_media(fileId=file_id)
     fh = BytesIO()
     downloader = MediaIoBaseDownload(fh, request)
     done = False
