@@ -1,0 +1,14 @@
+name: Cozy Scanner
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Python scanner
+        run: python scanner.py
