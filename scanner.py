@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Simplified CozyAI Scanner – logs setups and sends alerts
+# CozyAI Scanner – AI‑Powered (uses XGBoost model from Drive)
 
 import ccxt
 import pandas as pd
@@ -8,6 +8,7 @@ import time
 import os
 import json
 import requests
+import xgboost as xgb
 from datetime import datetime
 from io import BytesIO
 from google.oauth2 import service_account
@@ -15,15 +16,15 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 
 # ======================================================
-# CONFIGURATION – EDIT THIS LINE
+# CONFIGURATION – EDIT THESE
 # ======================================================
-DRIVE_FOLDER_ID = '1Ox77rDeIj7XEE_pyfE5TyKVtiYtbdcXe'
+DRIVE_FOLDER_ID = '1Ox77rDeIj7XEE_pyfE5TyKVtiYtbdcXe'   # your folder ID
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
 CHAT_ID = os.environ.get('CHAT_ID', '')
-MAX_SYMBOLS = 30   # start with 30 symbols
+MAX_SYMBOLS = 30
 # ======================================================
 
-# Helper: Google Drive
+# ---------- Google Drive helpers (same as before) ----------
 def get_drive_service():
     creds_json = os.environ.get('GDRIVE_CREDS')
     if not creds_json:
@@ -41,10 +42,9 @@ def download_file(drive, filename, folder_id):
     if not files:
         return None
     file_id = files[0]['id']
-    # Get the file's MIME type
+    # Get file's MIME type
     file_meta = drive.files().get(fileId=file_id, fields="mimeType").execute()
     mime_type = file_meta.get('mimeType')
-    # If it's a Google Sheets file, export as CSV
     if mime_type == 'application/vnd.google-apps.spreadsheet':
         request = drive.files().export_media(fileId=file_id, mimeType='text/csv')
     else:
@@ -79,7 +79,6 @@ def append_to_csv(drive, filename, folder_id, new_rows_df):
     df.to_csv(buf, index=False)
     upload_file(drive, filename, folder_id, buf.getvalue())
 
-# Telegram
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return
@@ -90,7 +89,7 @@ def send_telegram(message):
     except Exception as e:
         print(f"Telegram error: {e}")
 
-# Market data
+# ---------- Market data and feature extraction ----------
 def get_top_symbols(limit=MAX_SYMBOLS):
     exchange = ccxt.bitget()
     tickers = exchange.fetch_tickers()
@@ -101,14 +100,13 @@ def get_top_symbols(limit=MAX_SYMBOLS):
     pairs.sort(key=lambda x: x[1], reverse=True)
     return [p[0] for p in pairs[:limit]]
 
-def fetch_candles(symbol, limit=100):
+def fetch_candles(symbol, limit=150):
     exchange = ccxt.bitget({'enableRateLimit': True})
     candles = exchange.fetch_ohlcv(symbol, '1m', limit=limit)
     df = pd.DataFrame(candles, columns=['timestamp','open','high','low','close','volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     return df
 
-# Setup detection
 def detect_liquidity_sweep(df, lookback=20):
     if len(df) < lookback+5:
         return None
@@ -173,16 +171,48 @@ def get_session():
     else:
         return 'Asia'
 
-# Main
-def main():
-    symbols = get_top_symbols(MAX_SYMBOLS)   # first define symbols
-    print(f"Scanning {len(symbols)} symbols at {datetime.utcnow()}")   # then print
+def compute_regime(df):
+    atr = df['close'].rolling(14).apply(lambda x: np.ptp(x) if len(x) == 14 else np.nan).iloc[-1]
+    price = df['close'].iloc[-1]
+    vol = atr / price if price > 0 else 0
+    x = np.arange(20)
+    y = df['close'].tail(20).values
+    slope = np.polyfit(x, y, 1)[0] if len(y) == 20 else 0
+    return {'volatility': vol, 'trend_slope': slope}
 
-    setups = []
-    # ... rest of your code (the scanning loop, etc.)
-    print("Starting scanner...")
+def fetch_funding_and_oi(symbol):
+    exchange = ccxt.bitget({'options': {'defaultType': 'swap'}})
+    try:
+        base = symbol.split('/')[0]
+        futures_sym = f"{base}USDT:USDT"
+        funding = exchange.fetch_funding_rate(futures_sym)
+        oi = exchange.fetch_open_interest(futures_sym)
+        return {
+            'funding_rate': funding.get('fundingRate', 0),
+            'open_interest': oi.get('openInterest', 0)
+        }
+    except:
+        return {'funding_rate': 0, 'open_interest': 0}
+
+# ---------- Main scanning function with AI model ----------
+def main():
+    print(f"Starting AI scanner at {datetime.utcnow()}")
     drive = get_drive_service()
+
+    # Download AI model from Drive
+    model_file = download_file(drive, 'cozyai_model.json', DRIVE_FOLDER_ID)
+    model = None
+    if model_file:
+        # Load XGBoost model
+        model = xgb.Booster()
+        model.load_model(model_file)
+        print("AI model loaded.")
+    else:
+        print("No model found – using rule‑based fallback.")
+
     symbols = get_top_symbols(MAX_SYMBOLS)
+    print(f"Scanning {len(symbols)} symbols...")
+
     setups = []
     for sym in symbols:
         try:
@@ -197,40 +227,70 @@ def main():
                 continue
             volume_spike = compute_volume_spike(df)
             displacement = compute_displacement_strength(df, sweep['index'])
+            funding_oi = fetch_funding_and_oi(sym)
             session = get_session()
-            # Simple score (placeholder)
-            score = (sweep['sweep_size'] * 0.4 + volume_spike * 0.3 + displacement * 0.3)
+            regime = compute_regime(df)
+
+            # Prepare feature vector (must match training order)
+            features = [
+                sweep['sweep_size'],
+                fvg['width'] if 'width' in fvg else 0.0,
+                volume_spike,
+                displacement,
+                funding_oi['funding_rate'],
+                funding_oi['open_interest'],
+                regime['volatility'],
+                regime['trend_slope']
+            ]
+
+            if model:
+                # Predict expected R-multiple
+                dmatrix = xgb.DMatrix([features])
+                pred_ev = model.predict(dmatrix)[0]
+            else:
+                # Rule-based fallback (0-1 scale)
+                pred_ev = (sweep['sweep_size'] * 0.4 + volume_spike * 0.3 + displacement * 0.3)
+
             setups.append({
                 'timestamp': datetime.utcnow().isoformat(),
                 'symbol': sym,
                 'direction': 'LONG' if sweep['direction'] == 'long' else 'SHORT',
                 'price': sweep['price'],
                 'sweep_size': sweep['sweep_size'],
-                'fvg_width': 0.0,
+                'fvg_width': fvg['width'] if 'width' in fvg else 0.0,
                 'volume_spike': volume_spike,
                 'displacement': displacement,
-                'funding_rate': 0.0,
-                'open_interest': 0,
+                'funding_rate': funding_oi['funding_rate'],
+                'open_interest': funding_oi['open_interest'],
                 'session': session,
-                'volatility': 0.0,
-                'trend_slope': 0.0,
-                'entry_mid': (fvg['high'] + fvg['low'])/2,
+                'volatility': regime['volatility'],
+                'trend_slope': regime['trend_slope'],
+                'entry_mid': (fvg['high'] + fvg['low']) / 2,
                 'fvg_high': fvg['high'],
                 'fvg_low': fvg['low'],
-                'pred_ev': score
+                'pred_ev': pred_ev
             })
         except Exception as e:
             print(f"Error on {sym}: {e}")
         time.sleep(0.5)
+
     if setups:
         df_setups = pd.DataFrame(setups)
+        df_setups = df_setups.sort_values('pred_ev', ascending=False)
+        # Log to Drive
         append_to_csv(drive, 'raw_setups.csv', DRIVE_FOLDER_ID, df_setups)
-        best = df_setups.loc[df_setups['pred_ev'].idxmax()]
-        msg = (f"🤖 COZYAI SETUP\nSymbol: {best['symbol']}\nDirection: {best['direction']}\nScore: {best['pred_ev']:.2f}\nPrice: {best['price']:.2f}\nEntry zone: {best['fvg_low']:.2f}–{best['fvg_high']:.2f}")
+        # Alert top setup
+        best = df_setups.iloc[0]
+        msg = (f"🤖 COZYAI AI SIGNAL\n"
+               f"Symbol: {best['symbol']}\n"
+               f"Direction: {best['direction']}\n"
+               f"Predicted EV: {best['pred_ev']:.2f}R\n"
+               f"Price: {best['price']:.2f}\n"
+               f"Entry zone: {best['fvg_low']:.2f}–{best['fvg_high']:.2f}")
         send_telegram(msg)
-        print(f"Found {len(setups)} setups, alerted.")
+        print(f"Found {len(setups)} setups, alerted top.")
     else:
-        print("No setups.")
+        print("No setups found.")
 
 if __name__ == "__main__":
     main()
