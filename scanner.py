@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# CozyAI Scanner – Full AI with Survival Engine
-# Runs on GitHub Actions every 10 minutes
+# CozyAI Scanner – Full AI with Survival Engine (using trade_log.csv)
 
 import ccxt
 import pandas as pd
@@ -10,32 +9,31 @@ import os
 import json
 import requests
 import xgboost as xgb
-from datetime import datetime
+from datetime import datetime, date
 from io import BytesIO
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 
 # ======================================================
-# CONFIGURATION – EDIT THESE
+# CONFIGURATION
 # ======================================================
-DRIVE_FOLDER_ID = '1Ox77rDeIj7XEE_pyfE5TyKVtiYtbdcXe'   # your folder ID
+DRIVE_FOLDER_ID = '1Ox77rDeIj7XEE_pyfE5TyKVtiYtbdcXe'
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
 CHAT_ID = os.environ.get('CHAT_ID', '')
 MAX_SYMBOLS = 30
 
-# Survival parameters (all percentages of current equity)
+# Survival parameters
 MAX_DAILY_LOSS_PCT = 0.05      # 5% daily loss limit
 MAX_CONSECUTIVE_LOSSES = 3
-RISK_PER_TRADE_PCT = 0.01      # 1% risk per trade (adjust later)
 EV_THRESHOLD = 0.5
 MIN_VOLUME_SPIKE = 1.2
 
-# Auto‑trade flag (set to False for now, change to True when ready)
-AUTO_TRADE = False
+# Starting equity (used to compute percentages)
+STARTING_EQUITY = 3.0
 # ======================================================
 
-# ---------- Google Drive helpers ----------
+# ---------- Google Drive helpers (same as before) ----------
 def get_drive_service():
     creds_json = os.environ.get('GDRIVE_CREDS')
     if not creds_json:
@@ -71,7 +69,7 @@ def upload_file(drive, filename, folder_id, content_bytes):
     query = f"name='{filename}' and '{folder_id}' in parents and trashed=false"
     res = drive.files().list(q=query, fields="files(id)").execute()
     files = res.get('files', [])
-    media = MediaIoBaseUpload(BytesIO(content_bytes), mimetype='application/octet-stream', resumable=True)
+    media = MediaIoBaseUpload(BytesIO(content_bytes), mimetype='text/csv', resumable=True)
     if files:
         drive.files().update(fileId=files[0]['id'], media_body=media).execute()
     else:
@@ -89,42 +87,62 @@ def append_to_csv(drive, filename, folder_id, new_rows_df):
     df.to_csv(buf, index=False)
     upload_file(drive, filename, folder_id, buf.getvalue())
 
-# ---------- Survival State (stored in Drive) ----------
-SURVIVAL_FILE = 'survival_state.json'
-STARTING_EQUITY = 3.0   # initial simulated equity (only used when first created)
-
-def load_survival_state(drive, folder_id):
-    fh = download_file(drive, SURVIVAL_FILE, folder_id)
+def read_csv(drive, filename, folder_id):
+    fh = download_file(drive, filename, folder_id)
     if fh:
-        return json.load(fh)
+        return pd.read_csv(fh)
+    return None
+
+# ---------- Survival logic using trade_log.csv ----------
+def get_survival_status(drive, folder_id):
+    # Read trade log
+    df = read_csv(drive, 'trade_log.csv', folder_id)
+    if df is None or df.empty:
+        # No trades yet – safe to trade
+        return {'daily_loss_pct': 0.0, 'consecutive_losses': 0, 'equity': STARTING_EQUITY}
+
+    # Ensure timestamp is datetime
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    today = date.today()
+
+    # Today's trades
+    today_trades = df[df['timestamp'].dt.date == today]
+    # Calculate today's loss percentage (sum of negative pnl_percent)
+    daily_loss_pct = today_trades[today_trades['pnl_percent'] < 0]['pnl_percent'].sum()
+    daily_loss_pct = abs(daily_loss_pct)  # as positive percentage
+
+    # Calculate consecutive losses from the end
+    df_sorted = df.sort_values('timestamp', ascending=False)
+    consecutive_losses = 0
+    for _, row in df_sorted.iterrows():
+        if row['pnl_percent'] < 0:
+            consecutive_losses += 1
+        else:
+            break
+
+    # Compute current equity (starting + cumulative P&L)
+    cumulative_pnl = df['pnl_percent'].sum() / 100 * STARTING_EQUITY  # pnl_percent is in %? Need to be careful.
+    # Actually pnl_percent should be the percentage gain/loss of the trade relative to equity at that time.
+    # Simpler: sum of pnl in dollars. We'll assume trade_log has 'pnl' column.
+    # For now, we'll approximate equity as STARTING_EQUITY * (1 + total_return)
+    if 'pnl' in df.columns:
+        total_pnl = df['pnl'].sum()
+        equity = STARTING_EQUITY + total_pnl
     else:
-        # Initialize new state
-        state = {
-            'equity': STARTING_EQUITY,
-            'last_date': None,
-            'daily_loss_pct': 0.0,
-            'consecutive_losses': 0
-        }
-        # Save it immediately
-        save_survival_state(drive, folder_id, state)
-        return state
+        # fallback: use cumulative product of (1 + pnl_percent/100)
+        equity = STARTING_EQUITY * (1 + df['pnl_percent'].sum() / 100)
 
-def save_survival_state(drive, folder_id, state):
-    content = json.dumps(state, indent=2).encode()
-    upload_file(drive, SURVIVAL_FILE, folder_id, content)
+    return {
+        'daily_loss_pct': daily_loss_pct,
+        'consecutive_losses': consecutive_losses,
+        'equity': equity
+    }
 
-def check_survival_conditions(state, predicted_ev, current_date, volume_spike):
-    # Reset daily loss if new day
-    if state['last_date'] != current_date:
-        state['daily_loss_pct'] = 0.0
-        state['last_date'] = current_date
-        # Save the reset state
-        save_survival_state(drive, DRIVE_FOLDER_ID, state)
-
-    if state['daily_loss_pct'] >= MAX_DAILY_LOSS_PCT:
-        return False, f"Daily loss limit reached ({state['daily_loss_pct']*100:.1f}%)"
-    if state['consecutive_losses'] >= MAX_CONSECUTIVE_LOSSES:
-        return False, f"Consecutive losses ({state['consecutive_losses']})"
+def check_survival_conditions(status, predicted_ev, volume_spike):
+    if status['daily_loss_pct'] >= MAX_DAILY_LOSS_PCT:
+        return False, f"Daily loss limit reached ({status['daily_loss_pct']*100:.1f}%)"
+    if status['consecutive_losses'] >= MAX_CONSECUTIVE_LOSSES:
+        return False, f"Consecutive losses ({status['consecutive_losses']})"
     if predicted_ev < EV_THRESHOLD:
         return False, f"Predicted EV too low ({predicted_ev:.2f})"
     if volume_spike < MIN_VOLUME_SPIKE:
@@ -142,7 +160,7 @@ def send_telegram(message):
     except Exception as e:
         print(f"Telegram error: {e}")
 
-# ---------- Market data and feature extraction ----------
+# ---------- Market data and feature extraction (same as before) ----------
 def get_top_symbols(limit=MAX_SYMBOLS):
     exchange = ccxt.bitget()
     tickers = exchange.fetch_tickers()
@@ -247,14 +265,14 @@ def fetch_funding_and_oi(symbol):
     except:
         return {'funding_rate': 0, 'open_interest': 0}
 
-# ---------- Main scanning function ----------
+# ---------- Main ----------
 def main():
     print(f"Starting AI scanner at {datetime.utcnow()}")
     drive = get_drive_service()
 
-    # Load survival state
-    state = load_survival_state(drive, DRIVE_FOLDER_ID)
-    current_date = datetime.utcnow().date().isoformat()
+    # Load survival status from trade log
+    status = get_survival_status(drive, DRIVE_FOLDER_ID)
+    print(f"Equity: ${status['equity']:.2f}, Daily loss: {status['daily_loss_pct']*100:.2f}%, Consecutive losses: {status['consecutive_losses']}")
 
     # Load AI model
     model_file = download_file(drive, 'cozyai_model.json', DRIVE_FOLDER_ID)
@@ -338,10 +356,10 @@ def main():
         best = df_setups.iloc[0]
 
         # Check survival conditions
-        ok, reason = check_survival_conditions(state, best['pred_ev'], current_date, best['volume_spike'])
+        ok, reason = check_survival_conditions(status, best['pred_ev'], best['volume_spike'])
         if not ok:
             print(f"Trade blocked: {reason}")
-            # Optionally send a Telegram notification about the block
+            # Optionally send Telegram notification
             # send_telegram(f"⛔ Trading paused: {reason}")
         else:
             # Send alert
@@ -353,16 +371,8 @@ def main():
                    f"Entry zone: {best['fvg_low']:.2f}–{best['fvg_high']:.2f}")
             send_telegram(msg)
             print(f"Found {len(setups)} setups, alerted top.")
-
-            # If auto‑trade is enabled, place order here (future)
-            if AUTO_TRADE:
-                # Place order using Bitget API (to be implemented)
-                pass
     else:
         print("No setups found.")
-
-    # Save survival state (even if no change, keep it)
-    save_survival_state(drive, DRIVE_FOLDER_ID, state)
 
 if __name__ == "__main__":
     main()
