@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# CozyAI Scanner – AI‑Powered (uses XGBoost model from Drive)
+# CozyAI Scanner – Full AI with Survival Engine
+# Runs on GitHub Actions every 10 minutes
 
 import ccxt
 import pandas as pd
@@ -22,9 +23,19 @@ DRIVE_FOLDER_ID = '1Ox77rDeIj7XEE_pyfE5TyKVtiYtbdcXe'   # your folder ID
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
 CHAT_ID = os.environ.get('CHAT_ID', '')
 MAX_SYMBOLS = 30
+
+# Survival parameters (all percentages of current equity)
+MAX_DAILY_LOSS_PCT = 0.05      # 5% daily loss limit
+MAX_CONSECUTIVE_LOSSES = 3
+RISK_PER_TRADE_PCT = 0.01      # 1% risk per trade (adjust later)
+EV_THRESHOLD = 0.5
+MIN_VOLUME_SPIKE = 1.2
+
+# Auto‑trade flag (set to False for now, change to True when ready)
+AUTO_TRADE = False
 # ======================================================
 
-# ---------- Google Drive helpers (same as before) ----------
+# ---------- Google Drive helpers ----------
 def get_drive_service():
     creds_json = os.environ.get('GDRIVE_CREDS')
     if not creds_json:
@@ -42,7 +53,6 @@ def download_file(drive, filename, folder_id):
     if not files:
         return None
     file_id = files[0]['id']
-    # Get file's MIME type
     file_meta = drive.files().get(fileId=file_id, fields="mimeType").execute()
     mime_type = file_meta.get('mimeType')
     if mime_type == 'application/vnd.google-apps.spreadsheet':
@@ -61,7 +71,7 @@ def upload_file(drive, filename, folder_id, content_bytes):
     query = f"name='{filename}' and '{folder_id}' in parents and trashed=false"
     res = drive.files().list(q=query, fields="files(id)").execute()
     files = res.get('files', [])
-    media = MediaIoBaseUpload(BytesIO(content_bytes), mimetype='text/csv', resumable=True)
+    media = MediaIoBaseUpload(BytesIO(content_bytes), mimetype='application/octet-stream', resumable=True)
     if files:
         drive.files().update(fileId=files[0]['id'], media_body=media).execute()
     else:
@@ -79,6 +89,49 @@ def append_to_csv(drive, filename, folder_id, new_rows_df):
     df.to_csv(buf, index=False)
     upload_file(drive, filename, folder_id, buf.getvalue())
 
+# ---------- Survival State (stored in Drive) ----------
+SURVIVAL_FILE = 'survival_state.json'
+STARTING_EQUITY = 3.0   # initial simulated equity (only used when first created)
+
+def load_survival_state(drive, folder_id):
+    fh = download_file(drive, SURVIVAL_FILE, folder_id)
+    if fh:
+        return json.load(fh)
+    else:
+        # Initialize new state
+        state = {
+            'equity': STARTING_EQUITY,
+            'last_date': None,
+            'daily_loss_pct': 0.0,
+            'consecutive_losses': 0
+        }
+        # Save it immediately
+        save_survival_state(drive, folder_id, state)
+        return state
+
+def save_survival_state(drive, folder_id, state):
+    content = json.dumps(state, indent=2).encode()
+    upload_file(drive, SURVIVAL_FILE, folder_id, content)
+
+def check_survival_conditions(state, predicted_ev, current_date, volume_spike):
+    # Reset daily loss if new day
+    if state['last_date'] != current_date:
+        state['daily_loss_pct'] = 0.0
+        state['last_date'] = current_date
+        # Save the reset state
+        save_survival_state(drive, DRIVE_FOLDER_ID, state)
+
+    if state['daily_loss_pct'] >= MAX_DAILY_LOSS_PCT:
+        return False, f"Daily loss limit reached ({state['daily_loss_pct']*100:.1f}%)"
+    if state['consecutive_losses'] >= MAX_CONSECUTIVE_LOSSES:
+        return False, f"Consecutive losses ({state['consecutive_losses']})"
+    if predicted_ev < EV_THRESHOLD:
+        return False, f"Predicted EV too low ({predicted_ev:.2f})"
+    if volume_spike < MIN_VOLUME_SPIKE:
+        return False, f"Volume spike too low ({volume_spike:.2f})"
+    return True, "OK"
+
+# ---------- Telegram ----------
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return
@@ -194,16 +247,19 @@ def fetch_funding_and_oi(symbol):
     except:
         return {'funding_rate': 0, 'open_interest': 0}
 
-# ---------- Main scanning function with AI model ----------
+# ---------- Main scanning function ----------
 def main():
     print(f"Starting AI scanner at {datetime.utcnow()}")
     drive = get_drive_service()
 
-    # Download AI model from Drive
+    # Load survival state
+    state = load_survival_state(drive, DRIVE_FOLDER_ID)
+    current_date = datetime.utcnow().date().isoformat()
+
+    # Load AI model
     model_file = download_file(drive, 'cozyai_model.json', DRIVE_FOLDER_ID)
     model = None
     if model_file:
-        # Load XGBoost model
         model = xgb.Booster()
         model.load_model(model_file)
         print("AI model loaded.")
@@ -231,10 +287,10 @@ def main():
             session = get_session()
             regime = compute_regime(df)
 
-            # Prepare feature vector (must match training order)
+            # Prepare feature vector
             features = [
                 sweep['sweep_size'],
-                fvg['width'] if 'width' in fvg else 0.0,
+                fvg.get('width', 0.0),
                 volume_spike,
                 displacement,
                 funding_oi['funding_rate'],
@@ -244,11 +300,9 @@ def main():
             ]
 
             if model:
-                # Predict expected R-multiple
                 dmatrix = xgb.DMatrix([features])
                 pred_ev = model.predict(dmatrix)[0]
             else:
-                # Rule-based fallback (0-1 scale)
                 pred_ev = (sweep['sweep_size'] * 0.4 + volume_spike * 0.3 + displacement * 0.3)
 
             setups.append({
@@ -257,7 +311,7 @@ def main():
                 'direction': 'LONG' if sweep['direction'] == 'long' else 'SHORT',
                 'price': sweep['price'],
                 'sweep_size': sweep['sweep_size'],
-                'fvg_width': fvg['width'] if 'width' in fvg else 0.0,
+                'fvg_width': fvg.get('width', 0.0),
                 'volume_spike': volume_spike,
                 'displacement': displacement,
                 'funding_rate': funding_oi['funding_rate'],
@@ -277,20 +331,38 @@ def main():
     if setups:
         df_setups = pd.DataFrame(setups)
         df_setups = df_setups.sort_values('pred_ev', ascending=False)
-        # Log to Drive
+        # Log all setups to Drive
         append_to_csv(drive, 'raw_setups.csv', DRIVE_FOLDER_ID, df_setups)
-        # Alert top setup
+
+        # Get best setup
         best = df_setups.iloc[0]
-        msg = (f"🤖 COZYAI AI SIGNAL\n"
-               f"Symbol: {best['symbol']}\n"
-               f"Direction: {best['direction']}\n"
-               f"Predicted EV: {best['pred_ev']:.2f}R\n"
-               f"Price: {best['price']:.2f}\n"
-               f"Entry zone: {best['fvg_low']:.2f}–{best['fvg_high']:.2f}")
-        send_telegram(msg)
-        print(f"Found {len(setups)} setups, alerted top.")
+
+        # Check survival conditions
+        ok, reason = check_survival_conditions(state, best['pred_ev'], current_date, best['volume_spike'])
+        if not ok:
+            print(f"Trade blocked: {reason}")
+            # Optionally send a Telegram notification about the block
+            # send_telegram(f"⛔ Trading paused: {reason}")
+        else:
+            # Send alert
+            msg = (f"🤖 COZYAI AI SIGNAL\n"
+                   f"Symbol: {best['symbol']}\n"
+                   f"Direction: {best['direction']}\n"
+                   f"Predicted EV: {best['pred_ev']:.2f}R\n"
+                   f"Price: {best['price']:.2f}\n"
+                   f"Entry zone: {best['fvg_low']:.2f}–{best['fvg_high']:.2f}")
+            send_telegram(msg)
+            print(f"Found {len(setups)} setups, alerted top.")
+
+            # If auto‑trade is enabled, place order here (future)
+            if AUTO_TRADE:
+                # Place order using Bitget API (to be implemented)
+                pass
     else:
         print("No setups found.")
+
+    # Save survival state (even if no change, keep it)
+    save_survival_state(drive, DRIVE_FOLDER_ID, state)
 
 if __name__ == "__main__":
     main()
