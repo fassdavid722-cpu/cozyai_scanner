@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# CozyAI Scanner – God Tier (Full Intelligence + Self-Learning + Monte Carlo)
-# Runs on GitHub Actions every 10 minutes
+# CozyAI Scanner – Noise‑Filtered, Regularized, God‑Tier (No Syntax Errors)
 
 import ccxt
 import pandas as pd
@@ -33,8 +32,13 @@ MIN_VOLUME_SPIKE = 1.2
 STARTING_EQUITY = 3.0
 AUTO_TRADE = False
 
+# Noise filters
+ADX_THRESHOLD = 25
+MIN_VOLATILITY = 0.001
+MAX_EFFICIENCY_CHOP = 0.3   # if range efficiency < 0.3, market is choppy
+
 # ======================================================
-# Google Drive helpers
+# Google Drive helpers (same as before, no changes)
 # ======================================================
 def get_drive_service():
     creds_json = os.environ.get('GDRIVE_CREDS')
@@ -102,12 +106,10 @@ def get_survival_status(drive, folder_id):
     df = read_csv(drive, 'trade_log.csv', folder_id)
     if df is None or df.empty:
         return {'daily_loss_pct': 0.0, 'consecutive_losses': 0, 'equity': STARTING_EQUITY}
-
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     today = date.today()
     today_trades = df[df['timestamp'].dt.date == today]
     daily_loss_pct = abs(today_trades[today_trades['pnl'] < 0]['pnl'].sum()) / STARTING_EQUITY if STARTING_EQUITY > 0 else 0
-
     df_sorted = df.sort_values('timestamp', ascending=False)
     consecutive_losses = 0
     for _, row in df_sorted.iterrows():
@@ -115,7 +117,6 @@ def get_survival_status(drive, folder_id):
             consecutive_losses += 1
         else:
             break
-
     total_pnl = df['pnl'].sum()
     equity = STARTING_EQUITY + total_pnl
     return {'daily_loss_pct': daily_loss_pct, 'consecutive_losses': consecutive_losses, 'equity': max(equity, 0.5)}
@@ -189,14 +190,24 @@ def compute_range_efficiency(df, lookback=20):
         return 0.0
     return float(net_move / total_move)
 
-# ======================================================
-# Monte Carlo Simulation
-# ======================================================
-def monte_carlo_outcome(price, pred_ev, vol, num_sim=100):
-    simulated = [price + np.random.normal(loc=pred_ev * price, scale=vol * price) for _ in range(num_sim)]
-    mean_move = np.mean(simulated) - price
-    std_move = np.std(simulated)
-    return mean_move, std_move
+def compute_adx(df, period=14):
+    """Average Directional Index – values >25 indicate trending."""
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    plus_dm = high.diff()
+    minus_dm = low.diff()
+    plus_dm[plus_dm < 0] = 0
+    minus_dm[minus_dm > 0] = 0
+    tr = pd.concat([high - low,
+                    abs(high - close.shift(1)),
+                    abs(low - close.shift(1))], axis=1).max(axis=1)
+    atr = tr.rolling(period).mean()
+    plus_di = 100 * (plus_dm.rolling(period).mean() / atr)
+    minus_di = 100 * (abs(minus_dm).rolling(period).mean() / atr)
+    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+    adx = dx.rolling(period).mean()
+    return adx.iloc[-1] if not adx.empty else 20
 
 # ======================================================
 # Market Data & Signal Detection
@@ -211,15 +222,15 @@ def get_top_symbols(limit=MAX_SYMBOLS):
     pairs.sort(key=lambda x: x[1], reverse=True)
     return [p[0] for p in pairs[:limit]]
 
-def fetch_candles(symbol, limit=150):
+def fetch_candles(symbol, limit=100, timeframe='15m'):
     exchange = ccxt.bitget({'enableRateLimit': True})
-    candles = exchange.fetch_ohlcv(symbol, '1m', limit=limit)
+    candles = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
     df = pd.DataFrame(candles, columns=['timestamp','open','high','low','close','volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     return df
 
 def detect_liquidity_sweep(df, lookback=20):
-    if len(df) < lookback + 5:
+    if len(df) < lookback+5:
         return None
     recent = df.tail(30).copy()
     recent['high_20'] = recent['high'].rolling(lookback).max()
@@ -245,7 +256,7 @@ def detect_liquidity_sweep(df, lookback=20):
     return None
 
 def detect_fvg(df, sweep_idx):
-    if sweep_idx + 3 >= len(df):
+    if sweep_idx+3 >= len(df):
         return None
     c1 = df.iloc[sweep_idx]
     c2 = df.iloc[sweep_idx+1]
@@ -368,16 +379,13 @@ def place_order(symbol, direction, entry_price, position_size):
         return None
 
 # ======================================================
-# Self-Learning Retraining (can be called externally)
+# Monte Carlo Simulation (simplified)
 # ======================================================
-def retrain_model(drive, folder_id, model_path='cozyai_model.json'):
-    trades = read_csv(drive, 'trade_log.csv', folder_id)
-    if trades is None or len(trades) < 50:
-        return
-    # Assume we have features in trade_log (you'd need to store them)
-    # For simplicity, we'll skip full implementation here.
-    print("Retraining not implemented yet – will use weekly workflow.")
-    pass
+def monte_carlo_outcome(price, pred_ev, vol, num_sim=100):
+    simulated = [price + np.random.normal(loc=pred_ev * price, scale=vol * price) for _ in range(num_sim)]
+    mean_move = np.mean(simulated) - price
+    std_move = np.std(simulated)
+    return mean_move, std_move
 
 # ======================================================
 # Main Scanner Loop
@@ -407,60 +415,38 @@ def main():
 
     for sym in symbols:
         try:
-            df = fetch_candles(sym)
+            df = fetch_candles(sym)  # 15m timeframe
             if df is None or len(df) < 50:
                 continue
+
+            # ---- Noise filters ----
+            adx = compute_adx(df)
+            if adx < ADX_THRESHOLD:
+                continue
+            efficiency = compute_range_efficiency(df)
+            if efficiency < MAX_EFFICIENCY_CHOP:
+                continue
+            regime = compute_regime(df)
+            if regime['volatility'] < MIN_VOLATILITY:
+                continue
+
             sweep = detect_liquidity_sweep(df)
             if not sweep:
                 continue
             fvg = detect_fvg(df, sweep['index'])
             if not fvg:
                 continue
-                # Add this after compute_atr
-def compute_adx(df, period=14):
-    """Average Directional Index – values >25 indicate trending."""
-    high = df['high']
-    low = df['low']
-    close = df['close']
-    plus_dm = high.diff()
-    minus_dm = low.diff()
-    plus_dm[plus_dm < 0] = 0
-    minus_dm[minus_dm > 0] = 0
-    tr = pd.concat([high - low, 
-                    abs(high - close.shift(1)), 
-                    abs(low - close.shift(1))], axis=1).max(axis=1)
-    atr = tr.rolling(period).mean()
-    plus_di = 100 * (plus_dm.rolling(period).mean() / atr)
-    minus_di = 100 * (abs(minus_dm).rolling(period).mean() / atr)
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
-    adx = dx.rolling(period).mean()
-    return adx.iloc[-1] if not adx.empty else 20
-
-# Add these filters inside the setup loop (after computing features)
-adx = compute_adx(df)
-if adx < 25:
-    continue   # skip – not trending
-
-volatility_filter = regime['volatility']  # from compute_regime
-if volatility_filter < 0.001:   # too low volatility
-    continue
-
-efficiency = compute_range_efficiency(df)  # already defined
-if efficiency < 0.3:   # choppy
-    continue
 
             # Basic features
             volume_spike = compute_volume_spike(df)
             displacement = compute_displacement_strength(df, sweep['index'])
             funding_oi = fetch_funding_and_oi(sym)
             session = get_session()
-            regime = compute_regime(df)
 
             # Advanced features
             atr = compute_atr(df)
             zscore = compute_zscore(df['close'])
             acceleration = compute_momentum_acceleration(df)
-            efficiency = compute_range_efficiency(df)
             rsi = compute_rsi(df['close'])
             macd_val, macd_signal = compute_macd(df['close'])
 
@@ -492,7 +478,7 @@ if efficiency < 0.3:   # choppy
             confidence = compute_confidence_score(pred_ev, volume_spike, displacement, regime)
             risk = dynamic_risk_size(status['equity'], confidence)
 
-            # Monte Carlo simulation for expected move
+            # Monte Carlo simulation (optional)
             mean_move, std_move = monte_carlo_outcome(sweep['price'], pred_ev, regime['volatility'])
 
             setups.append({
@@ -550,7 +536,6 @@ if efficiency < 0.3:   # choppy
                 print(f"Trade skipped: notional too small (${position_size * best['price']:.2f})")
             else:
                 stop_price = best['price'] - stop_distance_price if best['direction'] == 'LONG' else best['price'] + stop_distance_price
-                # Build Telegram message
                 msg = (f"🤖 COZYAI GOD TIER SIGNAL\n"
                        f"Symbol: {best['symbol']}\n"
                        f"Direction: {best['direction']}\n"
@@ -560,8 +545,7 @@ if efficiency < 0.3:   # choppy
                        f"Stop: ${stop_price:.4f}\n"
                        f"Entry: ${best['price']:.4f}\n"
                        f"Zone: {best['fvg_low']:.4f}–{best['fvg_high']:.4f}\n"
-                       f"RSI: {best['rsi']:.1f} | MACD: {best['macd']:.2f}\n"
-                       f"MC mean: {best['monte_carlo_mean']:.2f} std: {best['monte_carlo_std']:.2f}")
+                       f"ADX: {adx:.1f} | RSI: {best['rsi']:.1f} | MACD: {best['macd']:.2f}")
                 send_telegram(msg)
                 print(f"Found {len(setups)} setups, alerted top.")
 
