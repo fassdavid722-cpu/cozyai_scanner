@@ -391,6 +391,7 @@ def monte_carlo_outcome(price, pred_ev, vol, num_sim=100):
 # Main Scanner Loop
 # ======================================================
 def main():
+    print("DEBUG: Scanner entered main()")
     print(f"Starting God Tier CozyAI scanner at {datetime.utcnow()}")
     drive = get_drive_service()
     status = get_survival_status(drive, DRIVE_FOLDER_ID)
