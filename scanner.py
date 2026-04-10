@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-CozyHybridAI — Production‑Ready Adaptive Trading Engine
+CozyHybridAI — Production‑Ready Adaptive Trading Engine (Final)
 - Ensemble of 5 strategies with adaptive weighting
 - Self‑learning memory (toxic hours, symbol biases, strategy performance)
 - Full risk management (daily loss, consecutive losses, timeout, leverage cap)
 - Realistic dry‑run simulation (price‑based PnL, friction model)
 - Live execution with attached SL/TP and emergency close
-- Google Drive logging (raw_setups.csv, trade_log.csv)
+- Google Drive logging (raw_setups.csv, trade_log.csv) using GDRIVE_CREDS secret
 - Telegram alerts
-- No ML yet – architecture ready to plug in XGBoost later
+- Fixed: minimum leverage 5x, minimum notional $5 for live trading
 """
 
 import os
@@ -46,8 +46,9 @@ USE_DEMO_TRADING = os.getenv("USE_DEMO_TRADING", "true").lower() == "true"
 STARTING_EQUITY = float(os.getenv("STARTING_EQUITY", "3.0"))
 MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.05"))
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
-MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", "3.0"))
-MIN_NOTIONAL = float(os.getenv("MIN_NOTIONAL", "0.5"))
+MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", "10.0"))
+MIN_LEVERAGE = 5.0                         # minimum leverage for small accounts
+MIN_NOTIONAL_EXCHANGE = 5.0                # Bitget BTC minimum ~$6.6, use $5 as safe
 RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "0.02"))
 BOOTSTRAP_THRESHOLD = float(os.getenv("BOOTSTRAP_THRESHOLD", "10.0"))
 BASE_THRESHOLD = float(os.getenv("BASE_THRESHOLD", "0.68"))
@@ -82,14 +83,19 @@ MEMORY_FILE = os.getenv("COZY_MEMORY_FILE", "cozy_memory.json")
 
 # Google Drive settings
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "1Ox77rDeIj7XEE_pyfE5TyKVtiYtbdcXe")
-GDRIVE_CREDS_JSON = os.getenv("GDRIVE_CREDS", "")
+GDRIVE_CREDS_JSON = os.getenv("GDRIVE_CREDS", "")          # MUST be set in GitHub Secrets
 LOG_TO_DRIVE = bool(GDRIVE_CREDS_JSON)
+
+print(f"DEBUG: GDRIVE_CREDS present = {bool(GDRIVE_CREDS_JSON)}")
+print(f"DEBUG: LOG_TO_DRIVE = {LOG_TO_DRIVE}")
+print(f"DEBUG: DRIVE_FOLDER_ID = {DRIVE_FOLDER_ID}")
 
 # ======================================================
 # GOOGLE DRIVE HELPERS
 # ======================================================
 def get_drive_service():
     if not GDRIVE_CREDS_JSON:
+        print("DEBUG: GDRIVE_CREDS not set, Drive logging disabled")
         return None
     try:
         creds_dict = json.loads(GDRIVE_CREDS_JSON)
@@ -579,7 +585,7 @@ def get_atr_pct(df: pd.DataFrame) -> float:
     return atr / price if price > 0 else 0
 
 # ======================================================
-# SIZING
+# SIZING (with minimum leverage and notional)
 # ======================================================
 def compute_position_size(equity: float, confidence: float, recent_trades: List[Dict]) -> float:
     confidence = clamp(confidence, 0.0, 1.0)
@@ -595,7 +601,8 @@ def compute_position_size(equity: float, confidence: float, recent_trades: List[
             kelly = clamp(kelly, 0.0, 0.10)
             risk_pct = min(risk_pct * (1.0 + kelly), 0.03)
     risk_amount = equity * risk_pct
-    return max(MIN_NOTIONAL, float(risk_amount))
+    # Enforce exchange minimum notional
+    return max(MIN_NOTIONAL_EXCHANGE, float(risk_amount))
 
 # ======================================================
 # MAIN ENGINE
@@ -609,6 +616,7 @@ class CozyHybridAI:
         except Exception:
             pass
         self.drive = get_drive_service() if LOG_TO_DRIVE else None
+        print(f"DEBUG: Drive service initialized: {self.drive is not None}")
 
     def _update_trade_day(self) -> None:
         today = datetime.now().date().isoformat()
@@ -841,16 +849,25 @@ class CozyHybridAI:
     def _calculate_trade_params(self, stop_dist_pct: float) -> Dict:
         equity = self.memory.get_equity()
         stop_dist_pct = max(float(stop_dist_pct), 0.006)
+        min_notional_exchange = MIN_NOTIONAL_EXCHANGE
+        min_leverage = MIN_LEVERAGE
+
         if equity < BOOTSTRAP_THRESHOLD:
             mode = "BOOTSTRAP"
-            size = MIN_NOTIONAL
-            lev = max(1.0, size / max(equity, 0.01))
+            # Force size to meet exchange minimum notional
+            size = max(MIN_NOTIONAL_EXCHANGE, min_notional_exchange)
+            # Calculate leverage needed to open this size with current equity
+            lev = max(min_leverage, size / max(equity, 0.01))
         else:
             mode = "PROFESSIONAL"
             ideal_size = (equity * RISK_PER_TRADE_PCT) / stop_dist_pct
-            size = max(MIN_NOTIONAL, ideal_size)
+            size = max(MIN_NOTIONAL_EXCHANGE, ideal_size, min_notional_exchange)
             lev = max(1.0, size / max(equity, 0.01))
-        lev = clamp(lev, 1.0, MAX_LEVERAGE)
+            lev = max(lev, min_leverage)
+
+        lev = clamp(lev, min_leverage, MAX_LEVERAGE)
+        size = max(size, min_notional_exchange)
+
         return {"mode": mode, "size": round(size, 4), "lev": round(lev, 2)}
 
     def _place_live_entry(self, symbol: str, side: str, amount: float, sl_price: float, tp_price: float):
