@@ -10,6 +10,7 @@ CozyHybridAI — Production‑Ready Adaptive Trading Engine
 - Google Drive logging (raw_setups.csv, trade_log.csv, cozy_memory.json)
 - Telegram alerts
 - Fixed: minimum leverage 5x, minimum notional $5 for live trading
+- NEW: Heartbeat, no‑setup explanations, startup/crash alerts, market pulse
 """
 
 import os
@@ -71,6 +72,10 @@ MIN_ATR_PCT = float(os.getenv("MIN_ATR_PCT", "0.003"))
 
 # Confidence decay for repeated symbols
 CONFIDENCE_DECAY = float(os.getenv("CONFIDENCE_DECAY", "0.05"))
+
+# Heartbeat and reporting (number of runs between messages)
+HEARTBEAT_INTERVAL_RUNS = int(os.getenv("HEARTBEAT_INTERVAL_RUNS", "6"))   # ~1 hour if runs every 10 min
+MARKET_PULSE_INTERVAL_RUNS = int(os.getenv("MARKET_PULSE_INTERVAL_RUNS", "12")) # ~2 hours
 
 STRATEGY_LIST = [
     "volume_breakout",
@@ -289,6 +294,12 @@ class Memory:
             "last_trade_side": None,
             "open_trade": None,
             "symbol_repeat": {},
+            "heartbeat": {
+                "last_run": None,
+                "run_count": 0,
+                "last_heartbeat_sent": None,
+                "last_market_pulse_sent": None,
+            },
         }
 
     def normalize(self) -> None:
@@ -307,6 +318,12 @@ class Memory:
         self.data.setdefault("last_trade_side", None)
         self.data.setdefault("open_trade", None)
         self.data.setdefault("symbol_repeat", {})
+        self.data.setdefault("heartbeat", {
+            "last_run": None,
+            "run_count": 0,
+            "last_heartbeat_sent": None,
+            "last_market_pulse_sent": None,
+        })
 
     def save(self) -> None:
         # Save locally
@@ -463,6 +480,15 @@ class Memory:
             self.data["daily_loss"] = 0.0
             self.data["last_trade_day"] = today
         self.save()
+
+    # Heartbeat helper
+    def update_heartbeat(self, run_count: int) -> None:
+        self.data["heartbeat"]["last_run"] = datetime.utcnow().isoformat()
+        self.data["heartbeat"]["run_count"] = run_count
+        self.save()
+
+    def get_last_run(self) -> Optional[str]:
+        return self.data["heartbeat"].get("last_run")
 
 # ======================================================
 # MARKET DATA & STRATEGIES
@@ -629,6 +655,14 @@ def get_atr_pct(df: pd.DataFrame) -> float:
     price = float(df["close"].iloc[-1])
     return atr / price if price > 0 else 0
 
+def compute_volume_spike(df: pd.DataFrame) -> float:
+    """Volume spike ratio (last volume / average of last 20)."""
+    if len(df) < 20:
+        return 1.0
+    avg_vol = df['volume'].rolling(20).mean().iloc[-1]
+    last_vol = df['volume'].iloc[-1]
+    return last_vol / avg_vol if avg_vol > 0 else 1.0
+
 # ======================================================
 # SIZING (with minimum leverage and notional)
 # ======================================================
@@ -649,7 +683,7 @@ def compute_position_size(equity: float, confidence: float, recent_trades: List[
     return max(MIN_NOTIONAL_EXCHANGE, float(risk_amount))
 
 # ======================================================
-# MAIN ENGINE
+# MAIN ENGINE (with heartbeat and reporting)
 # ======================================================
 class CozyHybridAI:
     def __init__(self):
@@ -660,6 +694,8 @@ class CozyHybridAI:
             self.exchange.load_markets()
         except Exception:
             pass
+        self.run_counter = 0
+        self.rejection_reasons = []   # accumulate reasons for no-setup summary
 
     def _update_trade_day(self) -> None:
         today = datetime.now().date().isoformat()
@@ -825,6 +861,7 @@ class CozyHybridAI:
     def _combine_signal(self, df: pd.DataFrame, symbol: str) -> Optional[Dict]:
         atr_pct = get_atr_pct(df)
         if atr_pct < MIN_ATR_PCT:
+            self.rejection_reasons.append("ATR too low")
             return None
 
         imbalance = fetch_order_book_imbalance(self.exchange, symbol)
@@ -854,6 +891,7 @@ class CozyHybridAI:
             weighted_score += score * w
             direction_votes[direction] += w
         if total_weight <= 0:
+            self.rejection_reasons.append("No strategy weight")
             return None
 
         combined_score = weighted_score / total_weight
@@ -877,6 +915,12 @@ class CozyHybridAI:
             strategies,
             key=lambda x: x[0] * float(weights.get(x[2], 0.1)),
         )[2] if strategies else "ensemble"
+
+        # Also check volume spike and sweep/FVG (these are already in strategies, but we add reasons)
+        volume_spike = compute_volume_spike(df)
+        if volume_spike < MIN_VOLUME_SPIKE:
+            self.rejection_reasons.append("Volume spike too low")
+            return None
 
         return {
             "symbol": symbol,
@@ -1053,52 +1097,121 @@ class CozyHybridAI:
         self.memory.data["last_trade_side"] = side
         self.memory.save()
 
+    def _send_heartbeat(self):
+        last_run = self.memory.get_last_run()
+        last_run_str = last_run if last_run else "never"
+        msg = (
+            f"🟢 CozyHybridAI Heartbeat\n"
+            f"Time: {datetime.utcnow().isoformat()}\n"
+            f"Run count: {self.run_counter}\n"
+            f"Last run: {last_run_str}\n"
+            f"Symbols scanned: {MAX_SYMBOLS}\n"
+            f"Equity: ${self.memory.get_equity():.2f}\n"
+            f"Open trade: {self.memory.data.get('open_trade') is not None}\n"
+            f"Regime: {self.last_regime if hasattr(self, 'last_regime') else 'unknown'}"
+        )
+        send_telegram(msg)
+        self.memory.update_heartbeat(self.run_counter)
+
+    def _send_no_setup_summary(self):
+        if not self.rejection_reasons:
+            return
+        # Count reasons
+        from collections import Counter
+        reason_counts = Counter(self.rejection_reasons)
+        msg = f"⚠️ No setup found after scanning {MAX_SYMBOLS} symbols.\nTop reasons:\n"
+        for reason, count in reason_counts.most_common(5):
+            msg += f"  - {reason}: {count}\n"
+        send_telegram(msg)
+
+    def _send_market_pulse(self):
+        msg = (
+            f"📊 Market Pulse\n"
+            f"Scans since last pulse: {HEARTBEAT_INTERVAL_RUNS}\n"
+            f"Equity: ${self.memory.get_equity():.2f}\n"
+            f"Open trade: {self.memory.data.get('open_trade') is not None}\n"
+            f"Last setup found: {self.memory.data.get('last_trade_symbol', 'none')}"
+        )
+        send_telegram(msg)
+
     def run(self) -> None:
         print("DEBUG: CozyHybridAI.run() started")
-        self.memory.sync_equity_from_exchange(self.exchange)
-        self._update_trade_day()
-        if not self._survival_gate():
-            return
-        self._manage_open_trade()
-        if self.memory.data.get("open_trade"):
-            print("DEBUG: Open trade exists, skipping new signal")
-            return
+        # Send startup alert
+        send_telegram("🟢 Trading AI started successfully")
         try:
-            symbols = get_top_symbols(self.exchange, MAX_SYMBOLS)
-        except Exception as exc:
-            send_telegram(f"⚠️ Failed to fetch symbols: {exc}")
-            return
-        if not symbols:
-            send_telegram("No futures symbols found.")
-            return
-        best_signal = None
-        best_df = None
-        for sym in symbols:
+            self.memory.sync_equity_from_exchange(self.exchange)
+            self._update_trade_day()
+            if not self._survival_gate():
+                return
+            self._manage_open_trade()
+            if self.memory.data.get("open_trade"):
+                print("DEBUG: Open trade exists, skipping new signal")
+                return
+
+            # Increment run counter and update heartbeat
+            self.run_counter = self.memory.data["heartbeat"]["run_count"] + 1
+            self.memory.update_heartbeat(self.run_counter)
+
+            # Fetch symbols and scan
             try:
-                df = fetch_ohlcv(self.exchange, sym, timeframe=TIMEFRAME, limit=OHLCV_LIMIT)
-                if df is None or len(df) < 50:
-                    continue
-                signal = self._combine_signal(df, sym)
-                if not signal:
-                    continue
-                if signal["direction"] == "neutral":
-                    continue
-                threshold = BASE_THRESHOLD + signal["bias"]
-                if signal["hour"] in self.memory.data.get("toxic_hours", []):
-                    threshold += 0.08
-                if signal["final_score"] < max(threshold, MIN_SIGNAL_SCORE):
-                    continue
-                if best_signal is None or signal["final_score"] > best_signal["final_score"]:
-                    best_signal = signal
-                    best_df = df
+                symbols = get_top_symbols(self.exchange, MAX_SYMBOLS)
             except Exception as exc:
-                print(f"Error on {sym}: {exc}")
-            time.sleep(0.25)
-        if not best_signal or best_df is None:
-            print("DEBUG: No high-confidence signal.")
-            return
-        print("DEBUG: Entering trade with best signal")
-        self._enter_trade(best_signal, best_df)
+                send_telegram(f"⚠️ Failed to fetch symbols: {exc}")
+                return
+            if not symbols:
+                send_telegram("No futures symbols found.")
+                return
+
+            best_signal = None
+            best_df = None
+            self.rejection_reasons = []
+
+            for sym in symbols:
+                try:
+                    df = fetch_ohlcv(self.exchange, sym, timeframe=TIMEFRAME, limit=OHLCV_LIMIT)
+                    if df is None or len(df) < 50:
+                        self.rejection_reasons.append("OHLCV data insufficient")
+                        continue
+
+                    signal = self._combine_signal(df, sym)
+                    if not signal:
+                        continue
+                    if signal["direction"] == "neutral":
+                        self.rejection_reasons.append("Direction neutral")
+                        continue
+
+                    threshold = BASE_THRESHOLD + signal["bias"]
+                    if signal["hour"] in self.memory.data.get("toxic_hours", []):
+                        threshold += 0.08
+                    if signal["final_score"] < max(threshold, MIN_SIGNAL_SCORE):
+                        self.rejection_reasons.append(f"Score below threshold ({signal['final_score']:.2f} < {threshold:.2f})")
+                        continue
+
+                    if best_signal is None or signal["final_score"] > best_signal["final_score"]:
+                        best_signal = signal
+                        best_df = df
+                        self.last_regime = signal["regime"]
+                except Exception as exc:
+                    print(f"Error on {sym}: {exc}")
+                    self.rejection_reasons.append(f"Exception: {str(exc)[:50]}")
+                time.sleep(0.25)
+
+            if not best_signal or best_df is None:
+                print("DEBUG: No high-confidence signal.")
+                self._send_no_setup_summary()
+                # Send heartbeat if interval reached
+                if self.run_counter % HEARTBEAT_INTERVAL_RUNS == 0:
+                    self._send_heartbeat()
+                if self.run_counter % MARKET_PULSE_INTERVAL_RUNS == 0:
+                    self._send_market_pulse()
+                return
+
+            print("DEBUG: Entering trade with best signal")
+            self._enter_trade(best_signal, best_df)
+
+        except Exception as e:
+            send_telegram(f"🔴 Scanner crashed: {e}")
+            raise
 
 # ======================================================
 # ENTRY POINT
