@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-CozyHybridAI — Production‑Ready Adaptive Trading Engine (Final)
+CozyHybridAI — Production‑Ready Adaptive Trading Engine
+- Persistent memory (cozy_memory.json stored in Google Drive)
 - Ensemble of 5 strategies with adaptive weighting
 - Self‑learning memory (toxic hours, symbol biases, strategy performance)
 - Full risk management (daily loss, consecutive losses, timeout, leverage cap)
 - Realistic dry‑run simulation (price‑based PnL, friction model)
 - Live execution with attached SL/TP and emergency close
-- Google Drive logging (raw_setups.csv, trade_log.csv) using GDRIVE_CREDS secret
+- Google Drive logging (raw_setups.csv, trade_log.csv, cozy_memory.json)
 - Telegram alerts
 - Fixed: minimum leverage 5x, minimum notional $5 for live trading
 """
@@ -47,8 +48,8 @@ STARTING_EQUITY = float(os.getenv("STARTING_EQUITY", "3.0"))
 MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.05"))
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
 MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", "10.0"))
-MIN_LEVERAGE = 5.0                         # minimum leverage for small accounts
-MIN_NOTIONAL_EXCHANGE = 5.0                # Bitget BTC minimum ~$6.6, use $5 as safe
+MIN_LEVERAGE = 5.0
+MIN_NOTIONAL_EXCHANGE = 5.0
 RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "0.02"))
 BOOTSTRAP_THRESHOLD = float(os.getenv("BOOTSTRAP_THRESHOLD", "10.0"))
 BASE_THRESHOLD = float(os.getenv("BASE_THRESHOLD", "0.68"))
@@ -79,7 +80,7 @@ STRATEGY_LIST = [
     "momentum",
 ]
 DEFAULT_STRATEGY_WEIGHTS = {s: 1.0 / len(STRATEGY_LIST) for s in STRATEGY_LIST}
-MEMORY_FILE = os.getenv("COZY_MEMORY_FILE", "cozy_memory.json")
+MEMORY_FILE = "cozy_memory.json"
 
 # Google Drive settings
 DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "1Ox77rDeIj7XEE_pyfE5TyKVtiYtbdcXe")
@@ -95,7 +96,6 @@ print(f"DEBUG: DRIVE_FOLDER_ID = {DRIVE_FOLDER_ID}")
 # ======================================================
 def get_drive_service():
     if not GDRIVE_CREDS_JSON:
-        print("DEBUG: GDRIVE_CREDS not set, Drive logging disabled")
         return None
     try:
         creds_dict = json.loads(GDRIVE_CREDS_JSON)
@@ -107,6 +107,33 @@ def get_drive_service():
         print(f"Drive auth error: {e}")
         return None
 
+def download_file(drive, filename, folder_id):
+    if not drive:
+        return None
+    try:
+        query = f"name='{filename}' and '{folder_id}' in parents and trashed=false"
+        res = drive.files().list(q=query, fields="files(id)").execute()
+        files = res.get('files', [])
+        if not files:
+            return None
+        file_id = files[0]['id']
+        file_meta = drive.files().get(fileId=file_id, fields="mimeType").execute()
+        mime_type = file_meta.get('mimeType')
+        if mime_type == 'application/vnd.google-apps.spreadsheet':
+            request = drive.files().export_media(fileId=file_id, mimeType='text/csv')
+        else:
+            request = drive.files().get_media(fileId=file_id)
+        fh = BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        fh.seek(0)
+        return fh
+    except Exception as e:
+        print(f"Download error {filename}: {e}")
+        return None
+
 def upload_file(drive, filename, folder_id, content_bytes):
     if not drive:
         return
@@ -114,14 +141,14 @@ def upload_file(drive, filename, folder_id, content_bytes):
         query = f"name='{filename}' and '{folder_id}' in parents and trashed=false"
         res = drive.files().list(q=query, fields="files(id)").execute()
         files = res.get('files', [])
-        media = MediaIoBaseUpload(BytesIO(content_bytes), mimetype='text/csv', resumable=True)
+        media = MediaIoBaseUpload(BytesIO(content_bytes), mimetype='application/json', resumable=True)
         if files:
             drive.files().update(fileId=files[0]['id'], media_body=media).execute()
         else:
             metadata = {'name': filename, 'parents': [folder_id]}
             drive.files().create(body=metadata, media_body=media).execute()
     except Exception as e:
-        print(f"Drive upload error: {e}")
+        print(f"Upload error {filename}: {e}")
 
 def append_to_csv(drive, filename, folder_id, new_rows_df):
     if not drive or new_rows_df.empty:
@@ -220,15 +247,26 @@ def apply_friction(price: float, is_entry: bool) -> float:
         return price * (1 - friction)
 
 # ======================================================
-# MEMORY (self‑learning core)
+# MEMORY (with Drive persistence)
 # ======================================================
 class Memory:
-    def __init__(self, file: str = MEMORY_FILE):
-        self.file = file
+    def __init__(self, drive, folder_id):
+        self.drive = drive
+        self.folder_id = folder_id
+        self.file = MEMORY_FILE
         self.data = self.load()
         self.normalize()
 
     def load(self) -> Dict:
+        # Try to load from Drive first
+        if self.drive:
+            fh = download_file(self.drive, self.file, self.folder_id)
+            if fh:
+                try:
+                    return json.load(fh)
+                except Exception as e:
+                    print(f"Error loading memory from Drive: {e}")
+        # Fallback to local file or default
         if os.path.exists(self.file):
             try:
                 with open(self.file, "r") as f:
@@ -271,8 +309,15 @@ class Memory:
         self.data.setdefault("symbol_repeat", {})
 
     def save(self) -> None:
+        # Save locally
         with open(self.file, "w") as f:
             json.dump(self.data, f, indent=4)
+        # Upload to Drive
+        if self.drive:
+            buf = BytesIO()
+            buf.write(json.dumps(self.data, indent=4).encode())
+            buf.seek(0)
+            upload_file(self.drive, self.file, self.folder_id, buf.getvalue())
 
     def sync_equity_from_exchange(self, exchange) -> None:
         try:
@@ -601,7 +646,6 @@ def compute_position_size(equity: float, confidence: float, recent_trades: List[
             kelly = clamp(kelly, 0.0, 0.10)
             risk_pct = min(risk_pct * (1.0 + kelly), 0.03)
     risk_amount = equity * risk_pct
-    # Enforce exchange minimum notional
     return max(MIN_NOTIONAL_EXCHANGE, float(risk_amount))
 
 # ======================================================
@@ -609,14 +653,13 @@ def compute_position_size(equity: float, confidence: float, recent_trades: List[
 # ======================================================
 class CozyHybridAI:
     def __init__(self):
-        self.memory = Memory()
+        self.drive = get_drive_service() if LOG_TO_DRIVE else None
+        self.memory = Memory(self.drive, DRIVE_FOLDER_ID)
         self.exchange = build_exchange()
         try:
             self.exchange.load_markets()
         except Exception:
             pass
-        self.drive = get_drive_service() if LOG_TO_DRIVE else None
-        print(f"DEBUG: Drive service initialized: {self.drive is not None}")
 
     def _update_trade_day(self) -> None:
         today = datetime.now().date().isoformat()
@@ -854,9 +897,7 @@ class CozyHybridAI:
 
         if equity < BOOTSTRAP_THRESHOLD:
             mode = "BOOTSTRAP"
-            # Force size to meet exchange minimum notional
             size = max(MIN_NOTIONAL_EXCHANGE, min_notional_exchange)
-            # Calculate leverage needed to open this size with current equity
             lev = max(min_leverage, size / max(equity, 0.01))
         else:
             mode = "PROFESSIONAL"
