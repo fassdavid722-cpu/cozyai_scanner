@@ -1,52 +1,51 @@
-#!/usr/bin/env python3 """ CozyHybridAI v3 — Institutional Scanner
+#!/usr/bin/env python3
+"""
+CozyHybridAI v3 — Institutional Scanner
 
 Features:
+- Bitget futures market scanner
+- 5-strategy ensemble with adaptive weighting
+- Liquidity / FVG / momentum / volume / orderbook / funding signals
+- Trade lifecycle manager (open -> manage -> close)
+- Logging (local + optional Google Drive sync)
+- Dry-run + live trading support
+- Heartbeat + stall watchdog
+- Self-learning memory system
 
-Bitget futures market scanner
-
-5-strategy ensemble with adaptive weighting
-
-Liquidity / FVG / momentum / volume / orderbook / funding signals
-
-Trade lifecycle manager (open -> manage -> close)
-
-Guaranteed local trade logging with optional Google Drive sync
-
-Dry-run simulation with realistic fills and timeout exits
-
-Live trading hooks with leverage, isolated margin, and attached SL/TP params
-
-Heartbeat + stall watchdog
-
-Diagnostic no-setup reports
-
-Self-learning memory: toxic hours, symbol bias, strategy performance, dynamic threshold
-
-Safe Telegram alerts
+IMPORTANT:
+- Start with DRY_RUN=true
+- LIVE_TRADING=false initially
+- Set all secrets via environment variables
+"""
 
 
-Important:
+from __future__ import annotations
 
-This file is designed to be pasted as your scanner.py replacement.
-
-Start with DRY_RUN=true and LIVE_TRADING=false.
-
-Set your secrets in environment variables. """
-
-
-from future import annotations
-
-import json import os import time import traceback from collections import Counter from dataclasses import dataclass, asdict from datetime import datetime, timedelta from io import BytesIO from pathlib import Path from typing import Any, Dict, List, Optional, Tuple
+import os
+import json
+import time
+import traceback
+from collections import Counter
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta
+from io import BytesIO
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+import ccxt
+import numpy as np
+import pandas as pd
 
-try: import ccxt except Exception as exc: raise RuntimeError("ccxt is required") from exc
-
-try: import numpy as np except Exception as exc: raise RuntimeError("numpy is required") from exc
-
-try: import pandas as pd except Exception as exc: raise RuntimeError("pandas is required") from exc
-
-try: from google.oauth2 import service_account from googleapiclient.discovery import build from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload except Exception: service_account = None build = None MediaIoBaseUpload = None MediaIoBaseDownload = None
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+except Exception:
+    service_account = None
+    build = None
+    MediaIoBaseUpload = None
+    MediaIoBaseDownload = None
 
 ======================================================
 
