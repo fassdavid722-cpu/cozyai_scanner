@@ -68,7 +68,7 @@ TAKER_FEE_PCT = float(os.getenv("TAKER_FEE_PCT", "0.0006"))
 SLIPPAGE_PCT = float(os.getenv("SLIPPAGE_PCT", "0.0003"))
 
 # Volatility filter (skip if ATR/price < MIN_ATR_PCT)
-MIN_VOLUME_SPIKE = 1.0
+MIN_VOLUME_SPIKE = 0.0   # 0.0 disables this filter entirely 
 MIN_ATR_PCT = float(os.getenv("MIN_ATR_PCT", "0.0005"))
 
 # Confidence decay for repeated symbols
