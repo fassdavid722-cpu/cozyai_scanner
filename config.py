@@ -1,0 +1,9 @@
+import os
+
+GROK_API_KEY = os.getenv("GROK_API_KEY")
+BITGET_API_KEY = os.getenv("BITGET_API_KEY")
+BITGET_SECRET = os.getenv("BITGET_SECRET")
+BITGET_PASSWORD = os.getenv("BITGET_PASSWORD")
+
+MIN_RISK_PCT = 0.01
+MAX_RISK_PCT = 0.05
