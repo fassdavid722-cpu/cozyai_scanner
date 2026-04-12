@@ -1,0 +1,8 @@
+ccxt
+pandas
+numpy
+requests
+python-dotenv
+python-telegram-bot
+scikit-learn
+xai-sdk
