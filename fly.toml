@@ -1,0 +1,10 @@
+app = "cozy-trader-agent"
+
+[build]
+  image = "python:3.11"
+
+[env]
+  PORT = "8080"
+
+[processes]
+  app = "python main.py"
