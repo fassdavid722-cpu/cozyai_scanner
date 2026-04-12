@@ -1,4 +1,5 @@
 import time
+from ai_brain import evaluate_signal_ai
 from scanner import scan_market
 from exchange import get_balance
 from risk import calculate_risk
