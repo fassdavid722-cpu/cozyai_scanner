@@ -2,8 +2,8 @@ name: Cozy Alpha v3.5
 
 on:
   schedule:
-    - cron: '*/10 * * * *'   # run every 10 minutes (adjust as needed)
-  workflow_dispatch:           # allow manual trigger
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
 
 jobs:
   scan:
@@ -15,16 +15,13 @@ jobs:
         with:
           python-version: '3.10'
       - name: Install dependencies
-        run: |
-          pip install ccxt pandas numpy scikit-learn requests python-dotenv
-          # Optional: install xai-sdk if you want Grok sentiment
-          # pip install xai-sdk
-      - name: Run scanner
+        run: pip install ccxt pandas numpy scikit-learn requests python-dotenv
+      - name: Run Cozy Alpha
         env:
           BITGET_API_KEY: ${{ secrets.BITGET_API_KEY }}
           BITGET_SECRET: ${{ secrets.BITGET_SECRET }}
           BITGET_PASSWORD: ${{ secrets.BITGET_PASSWORD }}
-          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           TRADE_MODE: paper
