@@ -3,15 +3,12 @@
 Cozy Alpha Agent v3.5 — Grok Sentiment + Telegram Chat Listener
 Single‑file trading bot with always‑on chat via Telegram.
 
-Run: python cozy_alpha.py
-- Scanner runs every 60 seconds.
-- Telegram bot listens for commands like /ask, /status, /help.
-
-Environment variables:
+Environment variables (set in GitHub Secrets or .env):
 - BITGET_API_KEY, BITGET_SECRET, BITGET_PASSWORD
-- GROQ_API_KEY (or XAI_API_KEY)
+- XAI_API_KEY (Grok)
 - CHAT_ID
 - TELEGRAM_BOT_TOKEN
+- TRADE_MODE (paper or live)
 """
 
 import os
@@ -22,7 +19,7 @@ import argparse
 import sys
 import time
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import deque
 
 import ccxt
@@ -32,7 +29,7 @@ import requests
 from dotenv import load_dotenv
 from sklearn.linear_model import LogisticRegression
 
-# Grok SDK
+# Grok SDK (optional, graceful fallback)
 try:
     from xai_sdk import Client as XAIClient
     from xai_sdk.chat import user, system
@@ -48,7 +45,7 @@ BITGET_API_KEY = os.getenv("BITGET_API_KEY")
 BITGET_SECRET = os.getenv("BITGET_SECRET")
 BITGET_PASSWORD = os.getenv("BITGET_PASSWORD")
 
-GROK_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("XAI_API_KEY")
+GROK_API_KEY = os.getenv("XAI_API_KEY")  # Grok API key
 
 TIMEFRAME_ENTRY = "1m"
 TIMEFRAME_FILTER = "5m"
@@ -73,8 +70,6 @@ STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 0.02))
 TAKE_PROFIT_PERCENT = float(os.getenv("TAKE_PROFIT_PERCENT", 0.04))
 
 ML_ENABLED = os.getenv("ML_ENABLED", "true").lower() == "true"
-ML_LEARNING_RATE = float(os.getenv("ML_LEARNING_RATE", 0.01))
-
 INITIAL_BALANCE = 1000
 RISK_PER_TRADE = 0.02
 
@@ -395,21 +390,6 @@ class RiskManager:
 
 risk_manager = RiskManager()
 
-# ======================== TRADE EXECUTOR ========================
-class TradeExecutor:
-    def __init__(self):
-        self.paper_trader = PaperTrader()
-
-    def execute_signal(self, symbol, signal_data):
-        if TRADE_MODE == "paper":
-            entry_price = get_current_price(symbol)
-            self.paper_trader.open_trade(symbol, signal_data["side"], entry_price)
-            risk_manager.position_open = True
-            return {"status": "paper_trade_opened", "entry_price": entry_price}
-        # Live trading code omitted for brevity (same as before)
-
-executor = TradeExecutor()
-
 # ======================== PAPER TRADER ========================
 class PaperTrader:
     def __init__(self, balance=INITIAL_BALANCE, log_file="trades.csv"):
@@ -466,6 +446,21 @@ class PaperTrader:
             if current_price >= sl or current_price <= tp:
                 self.close_trade(current_price)
 
+# ======================== TRADE EXECUTOR ========================
+class TradeExecutor:
+    def __init__(self):
+        self.paper_trader = PaperTrader()
+
+    def execute_signal(self, symbol, signal_data):
+        if TRADE_MODE == "paper":
+            entry_price = get_current_price(symbol)
+            self.paper_trader.open_trade(symbol, signal_data["side"], entry_price)
+            risk_manager.position_open = True
+            return {"status": "paper_trade_opened", "entry_price": entry_price}
+        # Live trading omitted for safety; add later if needed.
+
+executor = TradeExecutor()
+
 # ======================== TELEGRAM & CHAT ========================
 class CozyChat:
     def __init__(self):
@@ -479,7 +474,7 @@ Keep answers under 300 chars unless asked for detail. Be helpful and slightly sa
 
     def ask(self, user_input):
         if not self.client:
-            return "Grok connection offline. Check GROQ_API_KEY."
+            return "Grok connection offline. Check XAI_API_KEY."
         try:
             chat = self.client.chat.create(model=self.model)
             chat.append(system(self.identity))
@@ -508,13 +503,13 @@ def process_telegram_command(command, args):
             return "Ask me something! Example: /ask What's BTC doing?"
         return cozy_chat.ask(question)
     elif cmd == "/status":
-        pos = executor.paper_trader.position if TRADE_MODE == "paper" else None
+        pos = executor.paper_trader.position
         if pos:
             return f"📊 Open {pos['side'].upper()} on {pos['symbol']} @ {pos['entry_price']:.4f}"
         else:
             return "No open position. Scanning for setups."
     elif cmd == "/balance":
-        bal = executor.paper_trader.balance if TRADE_MODE == "paper" else "N/A"
+        bal = executor.paper_trader.balance
         return f"💰 Balance: {bal:.2f} USDT"
     elif cmd == "/help":
         return "Commands:\n/ask <question>\n/status\n/balance\n/help"
@@ -541,7 +536,6 @@ def telegram_polling():
                         cmd = parts[0]
                         args = parts[1:]
                         reply = process_telegram_command(cmd, args)
-                        # Reply to the same chat
                         reply_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                         requests.post(reply_url, json={"chat_id": chat_id, "text": reply}, timeout=5)
         except Exception as e:
