@@ -5,7 +5,7 @@ Single‑file trading bot with always‑on chat via Telegram.
 
 Environment variables (set in GitHub Secrets or .env):
 - BITGET_API_KEY, BITGET_SECRET, BITGET_PASSWORD
-- XAI_API_KEY (Grok)
+- GROK_API_KEY (Grok)
 - CHAT_ID
 - TELEGRAM_BOT_TOKEN
 - TRADE_MODE (paper or live)
@@ -45,7 +45,7 @@ BITGET_API_KEY = os.getenv("BITGET_API_KEY")
 BITGET_SECRET = os.getenv("BITGET_SECRET")
 BITGET_PASSWORD = os.getenv("BITGET_PASSWORD")
 
-GROK_API_KEY = os.getenv("XAI_API_KEY")  # Grok API key
+GROK_API_KEY = os.getenv("GROK_API_KEY")  # Grok API key
 
 TIMEFRAME_ENTRY = "1m"
 TIMEFRAME_FILTER = "5m"
